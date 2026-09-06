@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ポケカ所持枚数チェッカー</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f2f2f7; margin: 0; padding: 12px; color: #1c1c1e; }
+    h1 { font-size: 1.25rem; text-align: center; margin: 8px 0 4px; font-weight: 700; }
+
+    /* 同期ステータス */
+    .sync-status { text-align: center; font-size: 0.75rem; color: #8e8e93; margin-bottom: 12px; }
+    .sync-status button { margin-left: 8px; font-size: 0.75rem; border: 1px solid #c7c7cc; background: #fff; border-radius: 6px; padding: 2px 8px; }
+
+    /* 検索バー */
+    .search-bar { margin-bottom: 8px; }
+    .search-bar input { width: 100%; padding: 10px; border: 1px solid #007aff; border-radius: 8px; font-size: 15px; outline: none; background: #fff; }
+
+    /* 絞り込み・ソート */
+    .filter-sort-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+    .filter-sort-group select { width: 100%; padding: 10px; border: 1px solid #c7c7cc; border-radius: 8px; font-size: 14px; background: #fff; }
+
+    /* 集計表示 */
+    .stat-badge { font-size: 0.8rem; text-align: center; margin-bottom: 12px; color: #636366; }
+
+    /* グリッド表示 */
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+    .card-item { background: #fff; border-radius: 10px; padding: 8px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; flex-direction: column; justify-content: space-between; }
+    .card-item img { width: 100%; border-radius: 6px; aspect-ratio: 2.5 / 3.5; object-fit: contain; background: #f0f0f0; }
+    .card-title { font-size: 0.8rem; font-weight: bold; margin: 6px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .counter { display: flex; align-items: center; justify-content: space-between; background: #f2f2f7; border-radius: 8px; padding: 2px; margin-top: 4px; }
+    .btn-count { width: 32px; height: 32px; background: #fff; border: 1px solid #d1d1d6; border-radius: 6px; font-size: 1.1rem; font-weight: bold; }
+    .count-display { font-size: 0.95rem; font-weight: bold; color: #3a3a3c; }
+    .count-display.has-card { color: #d92525; }
+
+    .empty-msg { grid-column: 1 / -1; text-align: center; color: #8e8e93; font-size: 0.85rem; padding: 24px 0; }
+  </style>
+</head>
+<body>
+
+  <h1>ポケカ所持管理</h1>
+
+  <!-- 同期ステータス -->
+  <div class="sync-status" id="syncStatus">
+    公式サイトからカード情報を同期中...
+  </div>
+
+  <!-- 検索バー -->
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="🔍 カード名で検索...">
+  </div>
+
+  <!-- 絞り込み・ソート -->
+  <div class="filter-sort-group">
+    <select id="filterSelect">
+      <option value="all">表示: すべて</option>
+      <option value="owned">表示: 所持のみ (&gt;0)</option>
+      <option value="unowned">表示: 未所持のみ (=0)</option>
+    </select>
+
+    <select id="sortSelect">
+      <option value="newest">順序: 追加が新しい順</option>
+      <option value="oldest">順序: 追加が古い順</option>
+      <option value="countDesc">順序: 所持枚数が多い順</option>
+      <option value="countAsc">順序: 所持枚数が少ない順</option>
+      <option value="name">順序: 名前順</option>
+    </select>
+  </div>
+
+  <!-- 所持枚数サマリー -->
+  <div class="stat-badge" id="statBadge"></div>
+
+  <!-- カード一覧 -->
+  <div class="grid" id="cardGrid"></div>
+
+  <script>
+    // 指定の公式サイトURL（注: pg= を回しながら全ページ取得する形に拡張可能。現状は1ページ分のみ）
+    const TARGET_URL = 'https://www.pokemon-card.com/card-search/index.php?keyword=&regulation_sidebar_form=XY&pg=&illust=&sm_and_keyword=true';
+    const PLACEHOLDER_IMG =
+      'data:image/svg+xml;utf8,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="150" height="210">' +
+        '<rect width="100%" height="100%" fill="#eee"/>' +
+        '<text x="50%" y="50%" font-size="14" text-anchor="middle" fill="#999">No Image</text>' +
+        '</svg>'
+      );
+
+    // 1. 所持データの復元
+    let cards = [];
+    try {
+      cards = JSON.parse(localStorage.getItem('pokeCards') || '[]');
+    } catch (e) {
+      console.error('保存データの読み込みに失敗しました', e);
+      cards = [];
+    }
+
+    // --- ユーティリティ: HTMLエスケープ（XSS対策） ---
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = String(str ?? '');
+      return div.innerHTML;
+    }
+
+    // --- ユーティリティ: 一意なIDを発行 ---
+    let idCounter = 0;
+    function nextId() {
+      idCounter += 1;
+      return Date.now() * 1000 + idCounter;
+    }
+
+    // --- ユーティリティ: 画像URLからクエリ文字列を除去した「照合キー」を作る ---
+    // サイト側でキャッシュバスター等が付与されても同じカードとして扱うため
+    function normalizeImgKey(src) {
+      try {
+        const u = new URL(src);
+        return u.origin + u.pathname; // クエリ・ハッシュを除去
+      } catch (e) {
+        return src.split('?')[0].split('#')[0];
+      }
+    }
+
+    // 2. 画面状態（検索語・フィルタ・ソート）の復元
+    function loadSavedUIState() {
+      let savedUI = {};
+      try {
+        savedUI = JSON.parse(localStorage.getItem('pokeUIState') || '{}');
+      } catch (e) {
+        savedUI = {};
+      }
+      if (savedUI.search !== undefined) document.getElementById('searchInput').value = savedUI.search;
+      if (savedUI.filter !== undefined) document.getElementById('filterSelect').value = savedUI.filter;
+      if (savedUI.sort !== undefined) document.getElementById('sortSelect').value = savedUI.sort;
+    }
+
+    function saveUIState() {
+      const uiState = {
+        search: document.getElementById('searchInput').value,
+        filter: document.getElementById('filterSelect').value,
+        sort: document.getElementById('sortSelect').value
+      };
+      try {
+        localStorage.setItem('pokeUIState', JSON.stringify(uiState));
+      } catch (e) {
+        console.error('画面状態の保存に失敗しました', e);
+      }
+    }
+
+    function saveCards() {
+      try {
+        localStorage.setItem('pokeCards', JSON.stringify(cards));
+      } catch (e) {
+        console.error('カードデータの保存に失敗しました（容量制限の可能性）', e);
+      }
+    }
+
+    // 自動同期処理
+    async function syncFromTargetUrl() {
+      const statusEl = document.getElementById('syncStatus');
+      statusEl.innerHTML = '公式サイトからカード情報を同期中...';
+      try {
+        const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(TARGET_URL);
+        const res = await fetch(proxyUrl);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const htmlText = await res.text();
+
+        const addedCount = parseAndMergeCards(htmlText);
+        statusEl.textContent = addedCount > 0 ? `同期完了（新規 ${addedCount} 件追加）` : '最新の状態です';
+        statusEl.style.color = '#34c759';
+      } catch (err) {
+        console.error('同期に失敗しました', err);
+        statusEl.textContent = '同期失敗 / 保存済みデータで表示中';
+        statusEl.style.color = '#8e8e93';
+        // 手動リトライボタンを追加
+        const retryBtn = document.createElement('button');
+        retryBtn.textContent = '再試行';
+        retryBtn.onclick = syncFromTargetUrl;
+        statusEl.appendChild(retryBtn);
+      }
+    }
+
+    function parseAndMergeCards(htmlText) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(htmlText, 'text/html');
+
+      const imgs = Array.from(doc.querySelectorAll('img')).filter(img => {
+        const src = img.getAttribute('src') || '';
+        return src.includes('card_images') || src.includes('/card-search/assets/');
+      });
+
+      // 既存カードの照合キーを事前にSetへ（毎回find/someで全走査しないように）
+      const existingKeys = new Set(cards.map(c => normalizeImgKey(c.img)));
+
+      let addedCount = 0;
+      imgs.forEach(img => {
+        let src = img.getAttribute('src') || '';
+        if (!src) return;
+
+        if (src.startsWith('//')) {
+          src = 'https:' + src;
+        } else if (src.startsWith('/')) {
+          src = 'https://www.pokemon-card.com' + src;
+        } else if (!src.startsWith('http')) {
+          src = 'https://www.pokemon-card.com/card-search/' + src;
+        }
+
+        const key = normalizeImgKey(src);
+        if (existingKeys.has(key)) return; // 既に登録済み
+
+        const name = (img.getAttribute('alt') || 'ポケモンカード').trim();
+
+        cards.push({
+          id: nextId(),
+          name: name,
+          img: src,
+          count: 0
+        });
+        existingKeys.add(key);
+        addedCount++;
+      });
+
+      if (addedCount > 0) saveCards();
+      render();
+      return addedCount;
+    }
+
+    function updateCount(id, delta) {
+      const card = cards.find(c => c.id === id);
+      if (!card) return;
+      card.count = Math.max(0, card.count + delta);
+      saveCards();
+
+      // 個別のDOMだけ更新（全体再描画のガクつきを防ぐ）
+      const el = document.querySelector(`[data-card-id="${id}"] .count-display`);
+      if (el) {
+        el.textContent = `${card.count}枚`;
+        el.classList.toggle('has-card', card.count > 0);
+      }
+      updateStatBadge();
+
+      // ソートが枚数順の場合は並び順がずれるので、その時だけ全体再描画
+      const sortVal = document.getElementById('sortSelect').value;
+      if (sortVal === 'countDesc' || sortVal === 'countAsc') {
+        render();
+      }
+    }
+
+    function updateStatBadge() {
+      const statBadge = document.getElementById('statBadge');
+      const totalRegistered = cards.length;
+      const totalOwnedTypes = cards.filter(c => c.count > 0).length;
+      const totalCards = cards.reduce((sum, c) => sum + c.count, 0);
+      statBadge.textContent = `登録: ${totalRegistered}種類 | 所持: ${totalOwnedTypes}種類 (${totalCards}枚)`;
+    }
+
+    function getFilteredSortedList() {
+      const searchVal = document.getElementById('searchInput').value.trim().toLowerCase();
+      const filterVal = document.getElementById('filterSelect').value;
+      const sortVal = document.getElementById('sortSelect').value;
+
+      let list = cards.filter(c => {
+        if (searchVal && !c.name.toLowerCase().includes(searchVal)) return false;
+        if (filterVal === 'owned') return c.count > 0;
+        if (filterVal === 'unowned') return c.count === 0;
+        return true;
+      });
+
+      list.sort((a, b) => {
+        if (sortVal === 'newest') return b.id - a.id;
+        if (sortVal === 'oldest') return a.id
